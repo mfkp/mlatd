@@ -12,6 +12,7 @@
 //!       --addr 127.0.0.1:40160 --results-csv /tmp/cand.csv
 
 mod clocksync;
+mod handshakes;
 mod shard;
 mod solve;
 mod state;
@@ -78,7 +79,9 @@ struct Cli {
     no_client_results: bool,
     /// Work dir: sync.json, clients.json and aircraft.json are written
     /// here every 15 s in mlat-server's format, so existing monitoring
-    /// keeps working (plus partition.json, the shard map).
+    /// keeps working (plus partition.json, the shard map), and each
+    /// accepted handshake is appended to handshakes.log, rotated at 1 MiB
+    /// with two backups, as mlat-server keeps it.
     #[arg(long)]
     work_dir: Option<std::path::PathBuf>,
     /// Seconds between statistics lines on stdout; -1 disables them.
@@ -413,6 +416,13 @@ async fn main() -> Result<()> {
         });
     }
 
+    // handshakes.log beside them: the handshakes of the receivers let in.
+    let handshakes = cli.work_dir.as_deref().and_then(|dir| {
+        handshakes::HandshakeLog::start(dir)
+            .map_err(|e| eprintln!("mlatd: handshakes.log: not written ({e})"))
+            .ok()
+    });
+
     let uid_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let listener = TcpListener::bind(&listen)
         .await
@@ -438,6 +448,7 @@ async fn main() -> Result<()> {
         let uid = uid_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sync_cap = cli.sync_aircraft_per_receiver;
         let client_results = !cli.no_client_results;
+        let handshakes = handshakes.clone();
         tokio::spawn(async move {
             let cfg = ClientCfg {
                 hb_real,
@@ -446,6 +457,7 @@ async fn main() -> Result<()> {
                 uid,
                 sync_cap,
                 client_results,
+                handshakes,
             };
             if let Err(e) = handle_client(stream, router, publish, cfg).await {
                 eprintln!("mlatd: {peer}: {e:#}");
@@ -480,6 +492,8 @@ struct ClientCfg {
     sync_cap: usize,
     /// False under --no-client-results.
     client_results: bool,
+    /// handshakes.log, under --work-dir.
+    handshakes: Option<handshakes::HandshakeLog>,
 }
 
 async fn handle_client(
@@ -495,6 +509,7 @@ async fn handle_client(
         uid,
         sync_cap,
         client_results,
+        handshakes,
     } = cfg;
     let (conn_t0_unix, conn_t0) = epoch;
     stream.set_nodelay(true)?;
@@ -649,6 +664,14 @@ async fn handle_client(
         return Err(e.into());
     }
     println!("mlatd: {user} connected ({clock_type}, {negotiated})");
+    // Logged here, once the shard has taken the receiver (under an alias
+    // if its name was taken by another uuid) and it has been told so:
+    // refused handshakes stay out. mlat-server logs every line that
+    // parses, before checking it; holding back the refused ones keeps any
+    // JSON a stranger sends from rolling real receivers out of the file.
+    if let Some(log) = &handshakes {
+        log.record(&hs_line);
+    }
 
     // Single writer task: heartbeats and (if subscribed) result messages
     // funnel through one mpsc so the socket has exactly one writer. On
@@ -1105,6 +1128,7 @@ mod tests {
                 uid: 1,
                 sync_cap: 0,
                 client_results: true,
+                handshakes: None,
             };
             handle_client(stream, router, publish, cfg).await
         });
@@ -1124,5 +1148,85 @@ mod tests {
             .expect("handle_client returns once the client has closed")
             .unwrap()
             .unwrap();
+    }
+
+    /// handshakes.log holds the receivers let in, a second feeder under a
+    /// taken name included, each line as its client sent it; handshakes
+    /// refused for a missing position or a name taken with no uuid to
+    /// tell the two apart are not written.
+    #[tokio::test]
+    async fn accepted_handshakes_are_logged() {
+        let dir = std::env::temp_dir().join(format!("mlatd-hslog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = handshakes::HandshakeLog::start(&dir).unwrap();
+        let (out_tx, _out_rx) = mpsc::channel::<OutMsg>(64);
+        let (publish, _keep) = tokio::sync::broadcast::channel::<Arc<Published>>(16);
+        let (tx, rx) = mpsc::channel::<ShardMsg>(64);
+        let epoch = (0.0, std::time::Instant::now());
+        tokio::spawn(shard::run_shard(
+            State::new(0, 1.0, false, false, epoch),
+            rx,
+            out_tx,
+            Duration::from_millis(900),
+        ));
+        let handle = Arc::new(ShardHandle {
+            tx,
+            receivers: AtomicUsize::new(0),
+            rate: AtomicU64::new(0),
+        });
+        let router = Arc::new(Router::new(vec![handle], 1.0, 1000));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for uid in 1.. {
+                let (stream, _) = listener.accept().await.unwrap();
+                let cfg = ClientCfg {
+                    hb_real: Duration::from_secs(30),
+                    time_scale: 1.0,
+                    epoch,
+                    uid,
+                    sync_cap: 0,
+                    client_results: false,
+                    handshakes: Some(log.clone()),
+                };
+                tokio::spawn(handle_client(stream, router.clone(), publish.clone(), cfg));
+            }
+        });
+        let first = "{\"version\":3,\"compress\":[\"none\"],\"user\":\"Home\",\
+                     \"uuid\":\"aaaaaaaa-0000-0000-0000-000000000001\",\
+                     \"lat\":1.0,\"lon\":103.0,\"alt\":10.0,\"clock_type\":\"dump1090\"}";
+        let second = "{\"version\":3,\"compress\":[\"none\"],\"user\":\"Home\",\
+                      \"uuid\":\"bbbbbbbb-0000-0000-0000-000000000002\",\
+                      \"lat\":1.1,\"lon\":103.1,\"alt\":20.0,\"clock_type\":\"dump1090\"}";
+        let no_position = "{\"version\":3,\"compress\":[\"none\"],\"user\":\"Away\",\
+                           \"uuid\":\"cccccccc-0000-0000-0000-000000000003\"}";
+        let no_uuid = "{\"version\":3,\"compress\":[\"none\"],\"user\":\"Home\",\
+                       \"lat\":1.2,\"lon\":103.2,\"alt\":30.0,\"clock_type\":\"dump1090\"}";
+        let mut open = Vec::new();
+        for (hs, accepted) in [
+            (first, true),
+            (second, true),
+            (no_position, false),
+            (no_uuid, false),
+        ] {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(format!("{hs}\n").as_bytes()).await.unwrap();
+            let mut reply = vec![0u8; 4096];
+            let n = c.read(&mut reply).await.unwrap();
+            let reply = String::from_utf8_lossy(&reply[..n]);
+            assert_eq!(!reply.contains("deny"), accepted, "{hs} -> {reply}");
+            open.push(c);
+        }
+        let path = dir.join("handshakes.log");
+        let read = || std::fs::read_to_string(&path).unwrap_or_default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while read().lines().count() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(read(), format!("{first}\n{second}\n"));
+        drop(open);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

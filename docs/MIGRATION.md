@@ -9,7 +9,7 @@ selective traffic. The migration is a server-side swap.
 | mlat-server | mlatd | notes |
 |---|---|---|
 | `--client-listen [host:]tcp[:udp]` | `--client-listen [host:]tcp` | TCP only. Remove a UDP port suffix. |
-| `--work-dir DIR` | `--work-dir DIR` | `sync.json`, `clients.json`, `aircraft.json` in the same formats, every 15 s, written atomically; plus `partition.json`. There is no other state to migrate. |
+| `--work-dir DIR` | `--work-dir DIR` | `sync.json`, `clients.json`, `aircraft.json` in the same formats, every 15 s, written atomically; plus `partition.json`. `handshakes.log` as mlat-server keeps it: one JSON line per handshake, as the client sent it, rotated at 1 MiB to `handshakes.log.1` and `.2`. mlat-server logs every handshake that parses, refused ones too; mlatd logs those it lets in. There is no other state to migrate. |
 | `--write-csv FILE` | `--write-csv FILE` | Same column format. Optional in mlatd. |
 | `--basestation-listen [host:]port` | `--basestation-listen [host:]port` | Same SBS output; readsb pulls it with `--net-connector=<host>,<port>,sbs_in_mlat`. |
 | `--basestation-connect host:port` | `--basestation-connect host:port` | Same: mlatd dials readsb (`--net-sbs-in-port`) and pushes results, reconnecting every 5 s. May repeat. |

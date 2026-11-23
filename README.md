@@ -76,7 +76,7 @@ receives receiver coordinates. Bind the port to a private interface.
 | `--client-listen` | — | mlat-client port; `[host:]port`; a bare port binds 0.0.0.0 |
 | `--basestation-listen` | off | SBS/BaseStation output; readsb pulls it with `--net-connector=<host>,<port>,sbs_in_mlat` |
 | `--basestation-connect` | off | SBS/BaseStation output pushed to a `host:port` (a readsb `--net-sbs-in-port`), with reconnect; may repeat |
-| `--work-dir` | off | writes `sync.json`, `clients.json`, `aircraft.json` (mlat-server formats) and `partition.json` (the shard map as data) every 15 s |
+| `--work-dir` | off | writes `sync.json`, `clients.json`, `aircraft.json` (mlat-server formats) and `partition.json` (the shard map as data) every 15 s, and appends each accepted handshake to `handshakes.log`, one JSON line as the client sent it, rotated at 1 MiB to `.1` and `.2` as mlat-server rotates it; the log holds receiver coordinates |
 | `--status-interval` | 15 | seconds between statistics lines on stdout; -1 disables |
 | `--write-csv` | off | results CSV, mlat-server column format |
 | `--self-truth-csv` | off | also multilaterates ADS-B frames and scores each fix against the position the aircraft transmitted |
